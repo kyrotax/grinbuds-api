@@ -1,0 +1,7 @@
+# Model files (downloaded from Google Drive at runtime)
+*.pt
+*.pth
+
+# Python cache
+__pycache__/
+*.pyc
