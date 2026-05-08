@@ -43,10 +43,22 @@ def preprocess_image(image_bytes: bytes) -> torch.Tensor:
     else:
         img_with_bg = img_raw.convert("L")
     
+    # Helper function to pad image to square to prevent distortion
+    def pad_to_square(img):
+        width, height = img.size
+        if width == height:
+            return img
+        size = max(width, height)
+        result = Image.new(img.mode, (size, size), 255) # 255 is white background
+        result.paste(img, ((size - width) // 2, (size - height) // 2))
+        return result
+        
+    img_padded = pad_to_square(img_with_bg)
+    
     # 3. Assume real-world photos are dark ink on light background.
     # Auto-invert is disabled because room shadows can trigger false inversions
     # and ruin the prediction.
-    img_final = img_with_bg.convert("RGB")
+    img_final = img_padded.convert("RGB")
     
     # 5. Transform for model
     tf = transforms.Compose([
