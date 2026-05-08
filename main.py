@@ -43,17 +43,10 @@ def preprocess_image(image_bytes: bytes) -> torch.Tensor:
     else:
         img_with_bg = img_raw.convert("L")
     
-    # 3. Check polarity (white-on-black vs black-on-white)
-    stat = img_with_bg.resize((50, 50))
-    avg_brightness = sum(stat.getdata()) / (50 * 50)
-    
-    # 4. Invert if handwriting is white on dark background
-    if avg_brightness < 128:
-        img_final = Image.eval(img_with_bg, lambda x: 255 - x)
-    else:
-        img_final = img_with_bg
-        
-    img_final = img_final.convert("RGB")
+    # 3. Assume real-world photos are dark ink on light background.
+    # Auto-invert is disabled because room shadows can trigger false inversions
+    # and ruin the prediction.
+    img_final = img_with_bg.convert("RGB")
     
     # 5. Transform for model
     tf = transforms.Compose([
