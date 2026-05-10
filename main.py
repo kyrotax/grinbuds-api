@@ -154,7 +154,7 @@ def _gray_to_char_tensor(img_gray: Image.Image) -> torch.Tensor:
 # ============================================================
 
 def recognize_char_from_tensor(tensor: torch.Tensor) -> tuple:
-    """Recognize what character was written from pre-built tensor."""
+    """Recognize what character was written from pre-built tensor. Returns top5."""
     if char_model is None:
         return None, 0.0, []
 
@@ -162,14 +162,14 @@ def recognize_char_from_tensor(tensor: torch.Tensor) -> tuple:
         output = char_model(tensor)
         probs = torch.softmax(output, dim=1)[0]
 
-        top3_probs, top3_indices = torch.topk(probs, 3)
-        top3 = [(EMNIST_LABELS[idx.item()], prob.item()) for idx, prob in zip(top3_indices, top3_probs)]
+        top5_probs, top5_indices = torch.topk(probs, min(5, len(probs)))
+        top5 = [(EMNIST_LABELS[idx.item()], prob.item()) for idx, prob in zip(top5_indices, top5_probs)]
 
-        best_idx = top3_indices[0].item()
+        best_idx = top5_indices[0].item()
         best_char = EMNIST_LABELS[best_idx]
-        best_conf = top3_probs[0].item()
+        best_conf = top5_probs[0].item()
 
-    return best_char, best_conf, top3
+    return best_char, best_conf, top5
 
 
 def check_reversal(target: str, recognized: str) -> bool:
@@ -194,6 +194,17 @@ def normalize_char_for_comparison(char: str) -> str:
     return char.lower()
 
 
+def _find_char_in_top_predictions(target_lower: str, top_predictions: list) -> float:
+    """Check if a character appears in the top predictions, return its confidence or 0."""
+    for char, conf in top_predictions:
+        if normalize_char_for_comparison(char) == target_lower:
+            return conf
+    return 0.0
+
+
+# Minimum confidence to trust a "match" without deeper checking
+CONFIDENCE_THRESHOLD = 0.50
+
 def _analyze_single(image_bytes: bytes, target_char: str = None) -> dict:
     """Core analysis logic for a single image. Shared between /predict and /predict_batch."""
     # Step 0: Load and prepare image ONCE
@@ -203,19 +214,66 @@ def _analyze_single(image_bytes: bytes, target_char: str = None) -> dict:
     char_tensor = _gray_to_char_tensor(img_gray) if char_model else None
     dyslexia_tensor = _gray_to_dyslexia_tensor(img_gray) if dyslexia_model else None
 
-    # Step 2: Character Recognition
-    recognized_char, char_confidence, top3 = (None, 0.0, [])
+    # Step 2: Character Recognition (top5)
+    recognized_char, char_confidence, top5 = (None, 0.0, [])
     if char_tensor is not None:
-        recognized_char, char_confidence, top3 = recognize_char_from_tensor(char_tensor)
+        recognized_char, char_confidence, top5 = recognize_char_from_tensor(char_tensor)
     recognized_normalized = normalize_char_for_comparison(recognized_char) if recognized_char else None
 
-    # Step 3: Compare with target
+    # Step 3: Smart comparison with confidence cross-checking
     is_reversal = False
     is_mismatch = False
+    match_method = "none"
+
     if target_char and recognized_char:
         target_normalized = target_char.lower()
+        
+        # Check: does the top-1 prediction match the target?
+        top1_matches_target = target_normalized == (recognized_normalized or recognized_char.lower())
+
+        # Check: is the top-1 prediction a reversal of the target?
         is_reversal = check_reversal(target_char, recognized_normalized or recognized_char)
-        is_mismatch = target_normalized != (recognized_normalized or recognized_char.lower())
+
+        # Check for potential "confusers" in top-5
+        # If user draws 'w', 'W' or 'V' might be in top-5
+        confuser_chars = ['w', 'v', 'm', 'n'] if target_normalized in ['b', 'd'] else []
+        highest_confuser_conf = 0.0
+        for c in confuser_chars:
+            conf = _find_char_in_top_predictions(c, top5)
+            if conf > highest_confuser_conf:
+                highest_confuser_conf = conf
+
+        if top1_matches_target:
+            if char_confidence >= CONFIDENCE_THRESHOLD:
+                # Even if confident, if a strong confuser is present, be wary
+                if highest_confuser_conf > char_confidence * 0.6:
+                    is_mismatch = True
+                    match_method = "confuser_detected_high_conf"
+                else:
+                    is_mismatch = False
+                    match_method = "confident_match"
+            else:
+                # Model says "match" but with low confidence
+                reversal_char = REVERSAL_PAIRS.get(target_normalized, None)
+                reversal_in_top5_conf = _find_char_in_top_predictions(reversal_char, top5) if reversal_char else 0.0
+                
+                if reversal_in_top5_conf > 0 and reversal_in_top5_conf >= char_confidence * 0.6:
+                    is_reversal = True
+                    is_mismatch = True
+                    match_method = "low_conf_reversal_detected"
+                elif highest_confuser_conf > char_confidence * 0.5:
+                    is_mismatch = True
+                    match_method = "low_conf_confuser_detected"
+                else:
+                    is_mismatch = False
+                    match_method = "low_conf_match"
+        else:
+            # Top-1 does NOT match target
+            is_mismatch = True
+            if is_reversal:
+                match_method = "reversal"
+            else:
+                match_method = "clear_mismatch"
 
     # Step 4: Dyslexia quality model
     quality_probability = 0.5
@@ -228,26 +286,24 @@ def _analyze_single(image_bytes: bytes, target_char: str = None) -> dict:
     # Step 5: Combined Scoring
     indicators = []
     if char_model is not None and target_char:
-        if is_reversal:
+        if match_method == "confuser_detected_high_conf" or match_method == "low_conf_confuser_detected":
+            final_probability = max(0.6, quality_probability)
+            indicators.append(
+                f"Huruf diragukan: Model mengira '{recognized_char}' tapi terdeteksi kemiripan dengan huruf lain."
+            )
+        elif is_reversal:
             final_probability = max(0.85, quality_probability)
             indicators.append(
-                f"Pembalikan huruf terdeteksi: diminta '{target_char}' "
-                f"tetapi menulis '{recognized_char}' (confidence: {char_confidence*100:.0f}%)"
-            )
-            indicators.append(
-                f"Pembalikan {target_char}↔{recognized_char} adalah tanda umum disleksia"
+                f"Pembalikan huruf terdeteksi: diminta '{target_char}' tapi terbaca sebagai '{recognized_char}'"
             )
         elif is_mismatch:
             final_probability = max(0.65, quality_probability)
             indicators.append(
-                f"Huruf tidak cocok: diminta '{target_char}' "
-                f"tetapi menulis '{recognized_char}' (confidence: {char_confidence*100:.0f}%)"
+                f"Huruf tidak sesuai: diminta '{target_char}' tapi menulis '{recognized_char}'"
             )
         else:
             final_probability = quality_probability
-            indicators.append(
-                f"Huruf cocok: '{recognized_char}' sesuai target (confidence: {char_confidence*100:.0f}%)"
-            )
+            indicators.append(f"Huruf sesuai target: '{recognized_char}'")
     else:
         final_probability = quality_probability
 
@@ -268,7 +324,9 @@ def _analyze_single(image_bytes: bytes, target_char: str = None) -> dict:
         "target_char": target_char,
         "is_reversal": is_reversal,
         "is_mismatch": is_mismatch,
-        "top3_chars": [{"char": c, "confidence": round(p, 3)} for c, p in top3],
+        "match_method": match_method,
+        "top3_chars": [{"char": c, "confidence": round(p, 3)} for c, p in top5[:3]],
+        "top5_chars": [{"char": c, "confidence": round(p, 3)} for c, p in top5],
         "quality_score": float(quality_probability),
         "indicators": indicators,
         "message": "Success",
